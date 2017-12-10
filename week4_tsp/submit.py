@@ -216,7 +216,7 @@ def output(input_file, solver_file):
 
     start = time.clock()
     try:
-        solution = pkg.solve_it(input_file)
+        solution = pkg.solve_it(load_input_data(input_file))
     except Exception as e:
         print('the solve_it(input_data) method from solver.py raised an exception')
         print('try testing it with python ./solver.py before running this submission script')
