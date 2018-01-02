@@ -6,6 +6,8 @@ from collections import namedtuple
 
 import pandas as pd
 import numpy as np
+from datetime import datetime
+from collections import deque
 
 def load_data(filename):
     data = pd.read_csv(filename,sep=' ').reset_index()
@@ -29,6 +31,13 @@ def tsp_simple(data):
     sol = [data.index[0]]
     while len(sol) < len(data):
         sol += [closest_point(sol,data)]
+    return sol
+
+def tsp_simple_fast(data,closest_matrix):
+    sol = [data.index[0]]
+    while len(sol) < len(data):
+        last = sol[-1]
+        sol += [closest_matrix[last][~closest_matrix[last].isin(sol)].values[0]]
     return sol
 
 def objective(sol, data):
@@ -85,15 +94,41 @@ def objective_vec_swap(sol, obj_vec, p1 ,p2, data):
     res_obj_vec[-1]=dist2(dp1,dp2)
     return shift(res_obj_vec,len(sol)-pos1)
 
+def tabu_print(cur_sol,
+        cur_obj_vec,
+        data,
+        p1,
+        p2,
+        tabu_print_size):
+    cur_obj_vec = objective_vec_swap(cur_sol,cur_obj_vec,p1,p2,data)
+    return pd.Series(cur_obj_vec).sort_values(ascending=False).values[:tabu_print_size].tolist()
+
+def tabu_check_func(
+        cur_sol,
+        cur_obj_vec,
+        data,
+        p1,
+        p2,
+        tabu_list,
+        tabu_flag,
+        tabu_print_size):
+
+    tabu_print_check = tabu_print(cur_sol,cur_obj_vec,data,p1,p2,tabu_print_size)
+    return (tabu_flag and tabu_print_check not in tabu_list)  or not tabu_flag
+
 def local_search(
     data,
     max_trials,
     start_sol,
     start_obj_vec,
     closest_matrix,
-    first_closest=None):
+    first_closest=None,
+    tabu_flag = False,
+    tabu_print_frac=1.0,
+    tabu_size=1000):
 
     size = len(start_sol)
+    tabu_print_size = int(tabu_print_frac*size)
     cur_sol = start_sol
     cur_obj_vec = start_obj_vec
     cur_obj = sum(cur_obj_vec)
@@ -101,34 +136,101 @@ def local_search(
     opt_obj_vec = cur_obj_vec
     opt_obj = cur_obj
 
+    tabu_list = deque([])
     it = 0
+    print 'it 0 obj: %f'%(sum(map(np.sqrt,cur_obj_vec)))
     while (it < max_trials):
         order_points = pd.Series(cur_obj_vec).sort_values(ascending=False).index
-        found = False
-        max_trials_reached = False
-        for p1 in order_points:
-            for idx2 in closest_matrix[p1].index[1:first_closest if first_closest is not None else size]:
-                if it >= max_trials:
-                    max_trials_reached = True
-                    break
-                else:
-                    it+=1
-                p2 = closest_matrix[p1][idx2]
-                #print 'try (%d %d)'%(p1,p2)
-                new_obj = objective_swap(cur_sol, cur_obj, p1, p2, data)
-                if new_obj < opt_obj:
-                    cur_obj_vec = objective_vec_swap(cur_sol,cur_obj_vec,p1,p2,data)
-                    cur_obj = sum(cur_obj_vec)
-                    cur_sol = swap_tsp_2(cur_sol,p1,p2)
-                    print 'order %d closest rank %d swap (%d %d) obj: %f'%(order_points.get_loc(p1),idx2, p1,p2,sum(map(np.sqrt,cur_obj_vec)))
-                    opt_sol = cur_sol
-                    opt_obj_vec = cur_obj_vec
-                    opt_obj = sum(cur_obj_vec)
-                    found = True
-                    break
-            if found or max_trials_reached:
-                break
+
+        neighbourhood = { (p1,p2) : objective_swap(cur_sol, cur_obj,p1,p2,data) \
+                          for p1 in order_points[:first_closest] \
+                          for p2 in closest_matrix[p1][1:first_closest]}
+
+        it += len(neighbourhood)
+
+        neighbourhood = { k : neighbourhood[k] for k in neighbourhood.keys()
+                          if neighbourhood[k] <> cur_obj
+                          if tabu_check_func(cur_sol, cur_obj_vec, data,
+                                             k[0], k[1],
+                                             tabu_list,tabu_flag,tabu_print_size)}
+
+        p1,p2 = min(neighbourhood, key=lambda k: neighbourhood[k])
+
+        tabu_list.appendleft(tabu_print(cur_sol,cur_obj_vec,data,p1,p2,tabu_print_size))
+        while (len(tabu_list)>tabu_size):
+            #print 'empty tabu list'
+            tabu_list.pop()
+
+        cur_obj_vec = objective_vec_swap(cur_sol,cur_obj_vec,p1,p2,data)
+        cur_sol = swap_tsp_2(cur_sol,p1,p2)
+        cur_obj = sum(cur_obj_vec)
+        print 'it %d swap (%d %d) obj: %f'%(it,
+                                            p1,p2,
+                                            sum(map(np.sqrt,cur_obj_vec)))
+
+        if cur_obj < opt_obj:
+            opt_sol[:] = cur_sol
+            opt_obj_vec[:] = cur_obj_vec
+            opt_obj = cur_obj
+            print 'it opt %d obj: %f'%(it,sum(map(np.sqrt,opt_obj_vec)))
     return sum(map(np.sqrt,opt_obj_vec)), opt_sol
+
+def dist_matrix_calc(data):
+    data_x = np.repeat(data['x'].values,len(data)).reshape((len(data),len(data)))
+    data_y = np.repeat(data['y'].values,len(data)).reshape((len(data),len(data)))
+    return pd.DataFrame((data_x-data_x.T)*(data_x-data_x.T)+(data_y-data_y.T)*(data_y-data_y.T))
+
+
+def closest_matrix_calc_step(data, start_idx, end_idx, first_closest):
+    data_x = data.x.values
+    data_y = data.y.values
+    data_x_1 = np.repeat(data_x,end_idx-start_idx).reshape(len(data),end_idx-start_idx)
+    data_x_2 = np.repeat(data_x[start_idx:end_idx],len(data)).reshape((end_idx-start_idx,len(data))).T
+    data_y_1 = np.repeat(data_y,end_idx-start_idx).reshape(len(data),end_idx-start_idx)
+    data_y_2 = np.repeat(data_y[start_idx:end_idx],len(data)).reshape((end_idx-start_idx,len(data))).T
+    dist_matrix = pd.DataFrame((data_x_2-data_x_1)*(data_x_2-data_x_1)
+                               +(data_y_2-data_y_1)*(data_y_2-data_y_1),
+                              columns=range(start_idx,end_idx))
+    return pd.DataFrame([dist_matrix[c].nsmallest(first_closest).index for c in dist_matrix.columns],
+                        index=range(start_idx, end_idx)).T
+
+def closest_matrix_calc(data, first_closest, step=100):
+    steps = range(0,len(data),step)+[len(data)]
+    return pd.concat([closest_matrix_calc_step(data,start_idx,end_idx,first_closest)
+               for (start_idx, end_idx) in zip(steps[:-1],steps[1:])],axis=1)
+
+
+def solve_tsp(filename,max_trials,
+              first_closest,
+              tabu_flag = False,
+              tabu_print_frac = 1.0,
+              tabu_size = 1000,
+              closest_matrix=None,
+              calc_first_closest=1000,
+              step=1000,
+              simple_fast_flag = True):
+    data = load_data(filename)
+    start_time = datetime.now()
+    if closest_matrix is None:
+        closest_matrix = closest_matrix_calc(data,calc_first_closest,step)
+    closest_matrix_time = datetime.now()
+    print 'closest_matrix time : %d'%((closest_matrix_time-start_time).seconds)
+    if simple_fast_flag:
+        sol_step0 = tsp_simple_fast(data,closest_matrix)
+    else:
+        sol_step0 = tsp_simple(data)
+    start_sol_time = datetime.now()
+    print 'start sol time : %d'%((start_sol_time-closest_matrix_time).seconds)
+    obj_vec = objective2_vec(sol_step0,data)
+    opt_obj, opt_sol = local_search(data,max_trials,sol_step0,obj_vec,closest_matrix,first_closest,
+                                    tabu_flag,
+                                    tabu_print_frac,
+                                    tabu_size)
+    start_local_search_time = datetime.now()
+    print 'local_search time : %d'%((start_local_search_time-start_sol_time).seconds)
+    return opt_obj, opt_sol
+
+
 
 def solve_it(input_file):
     # Modify this code to run your optimization algorithm
