@@ -9,8 +9,10 @@ import numpy as np
 from scipy.spatial import KDTree
 from datetime import datetime
 from collections import deque
-from tqdm import tqdm_notebook, tqdm
+from tqdm import tqdm_notebook, tqdm, tnrange
 import matplotlib.pyplot as plt
+import random
+import os
 
 def load_data(filename):
     data = pd.read_csv(filename,sep=' ').reset_index()
@@ -43,12 +45,13 @@ def tsp_simple_fast(data,closest_matrix):
         sol += [closest_matrix[last][~closest_matrix[last].isin(sol)].values[0]]
     return sol
 
-def tsp_simple_fast_kd(data, step=10):
-    sol = [data.index[0]]
-    remainings = set(range(1,len(data)))
-    kd = KDTree(data.loc[1:].values)
+def tsp_simple_fast_kd(data, step=10, first_point = 0, no_progress=False):
+    sol = [data.index[first_point]]
+    remainings = set(range(0,len(data)))-set([first_point])
+    kd = KDTree(data.loc[list(remainings)].values)
     kd_index = np.array(list(remainings))
-    bar = tqdm_notebook(total=len(data)-1,desc='first sol')
+    if no_progress:
+        bar = tqdm_notebook(total=len(data)-1,desc='first sol')
     idx = 0
     while len(sol) < len(data):
         last = sol[-1]
@@ -62,12 +65,19 @@ def tsp_simple_fast_kd(data, step=10):
                 kd = KDTree(data.loc[list(remainings)].values)
                 kd_index = np.array(list(remainings))
 
-        bar.update(1)
+        if no_progress:
+            bar.update(1)
         idx = idx + 1
         sol += [closest_remaining[0]]
 
         remainings -= set([sol[-1]])
     return sol
+
+def best_tsp_simple(data, nb_sample=5, step=10):
+    first_points = random.sample(range(len(data)),nb_sample)
+    tsp_simple_sols = {first_points[idx] : tsp_simple_fast_kd(data,step,first_points[idx]) for idx in tnrange(nb_sample, desc='best tsp simple')}
+    tsp_simple_obj = {p : objective_fast(tsp_simple_sols[p],data) for p in tsp_simple_sols.keys()}
+    return tsp_simple_sols[min(tsp_simple_sols, key=lambda k: tsp_simple_obj[k])]
 
 def plot_sol(data,sol):
     plt.plot(data.loc[sol].x,data.loc[sol].y)
@@ -88,13 +98,23 @@ def objective2_vec_fast(sol, data):
 def objective_fast(sol, data):
     return sum(np.sqrt(objective2_vec_fast(sol, data)))
 
+def outfilename(filename, suffix):
+    return filename.replace('data','out')+suffix
+
 def save_sol(sol, data, filename,suffix):
     obj = objective(sol,data)
     output_data = str(obj) + ' ' + str(0) + '\n'
     output_data += ' '.join(map(str, sol))
-    f = open(filename.replace('data','out')+suffix,'w')
+    f = open(outfilename(filename,suffix),'w')
     f.write(output_data)
     f.close()
+
+def load_sol(filename):
+    f = open(filename)
+    sol= f.readlines()[1].split(' ')
+    sol = map(lambda p: int(p),sol)
+    f.close()
+    return sol
 
 def shift(seq, n):
     return seq[n:]+seq[:n]
@@ -115,7 +135,10 @@ def objective_swap(sol, obj, p1 ,p2, data):
     dp2 = data.loc[p2]
     dp1_next = data.loc[p1_next]
     dp2_next = data.loc[p2_next]
-    return obj - dist2(dp1,dp1_next) - dist2(dp2,dp2_next) + dist2(dp1,dp2) + dist2(dp1_next,dp2_next)
+    return obj - np.sqrt(dist2(dp1,dp1_next))\
+           - np.sqrt(dist2(dp2,dp2_next)) \
+           + np.sqrt(dist2(dp1,dp2)) \
+           + np.sqrt(dist2(dp1_next,dp2_next))
 
 def objective_vec_swap(sol, obj_vec, p1 ,p2, data):
     pos1 = sol.index(p1)
@@ -226,14 +249,65 @@ def local_search_greedy(
             #print 'it %d obj: %f'%(it,sum(map(np.sqrt,opt_obj_vec)))
     return sum(map(np.sqrt,opt_obj_vec)), opt_sol
 
+def min_of_neighbourhood(neighbourhood_list,
+                         data,
+                         cur_sol,
+                         cur_obj,
+                         cur_obj_vec,
+                         tabu_flag,
+                         tabu_print_size,
+                         tabu_list):
+    neighbourhood = { (p1,p2) : objective_swap(cur_sol, cur_obj,p1,p2,data) \
+                          for (p1,p2) in neighbourhood_list}
+
+    neighbourhood = { k : neighbourhood[k] for k in neighbourhood.keys()
+                          if neighbourhood[k] <> cur_obj
+                          if tabu_check_func(cur_sol, cur_obj_vec, data,
+                                             k[0], k[1],
+                                             tabu_list,tabu_flag,tabu_print_size)}
+
+    return min(neighbourhood, key=lambda k: neighbourhood[k])
+
+def first_better_of_neighbourhood(neighbourhood_list,
+                         data,
+                         cur_sol,
+                         cur_obj,
+                         cur_obj_vec,
+                         tabu_flag,
+                         tabu_print_size,
+                         tabu_list):
+    it = 0
+    best_obj = None
+    for p1,p2 in neighbourhood_list:
+        new_obj = objective_swap(cur_sol, cur_obj,p1,p2,data)
+        it += 1
+        if new_obj < cur_obj:
+            if tabu_check_func(cur_sol,
+                               cur_obj_vec,
+                               data, p1, p2,
+                               tabu_list, tabu_flag,
+                               tabu_print_size):
+                return p1,p2, it
+        else:
+            if best_obj is None:
+                best_p1=p1
+                best_p2=p2
+            else:
+                if new_obj< best_obj:
+                    best_p1=p1
+                    best_p2=p2
+    return best_p1, best_p2, it
+
 def local_search_tabu(
     data,
     max_trials,
     start_sol,
     start_obj_vec,
     closest_matrix,
+    neighbourhood_type,
     first_points=None,
     first_closest=None,
+    random_pick_size = None,
     tabu_flag = False,
     tabu_print_size=100,
     tabu_size=1000):
@@ -250,27 +324,40 @@ def local_search_tabu(
 
     tabu_list = deque([])
     it = 0
+    path = []
     #print 'it 0 obj: %f'%(sum(map(np.sqrt,cur_obj_vec)))
     while (it < max_trials):
         order_points = pd.Series(cur_obj_vec).sort_values(ascending=False).index
 
-        neighbourhood = { (p1,p2) : objective_swap(cur_sol, cur_obj,p1,p2,data) \
+        neighbourhood_list = [ (p1,p2) \
                           for p1 in order_points[:first_points if first_points is not None else size] \
-                          for p2 in closest_matrix[p1][1:first_closest if first_closest is not None else size]}
+                          for p2 in closest_matrix[p1][1:first_closest if first_closest is not None else size]]
 
-        it += len(neighbourhood)
+        if random_pick_size is not None:
+            neighbourhood_list = random.sample(neighbourhood_list,random_pick_size)
 
-        bar.set_description('obj: %f'%(sum(map(np.sqrt,cur_obj_vec))))
-        bar.update(len(neighbourhood))
-
-
-        neighbourhood = { k : neighbourhood[k] for k in neighbourhood.keys()
-                          if neighbourhood[k] <> cur_obj
-                          if tabu_check_func(cur_sol, cur_obj_vec, data,
-                                             k[0], k[1],
-                                             tabu_list,tabu_flag,tabu_print_size)}
-
-        p1,p2 = min(neighbourhood, key=lambda k: neighbourhood[k])
+        if neighbourhood_type == 'best':
+            p1,p2 = min_of_neighbourhood(neighbourhood_list,
+                                         data,
+                                         cur_sol,
+                                         cur_obj,
+                                         cur_obj_vec,
+                                         tabu_flag,
+                                         tabu_print_size,
+                                         tabu_list)
+            it += len(neighbourhood_list)
+            bar.update(len(neighbourhood_list))
+        else:
+            p1,p2, add_it = first_better_of_neighbourhood(neighbourhood_list,
+                                         data,
+                                         cur_sol,
+                                         cur_obj,
+                                         cur_obj_vec,
+                                         tabu_flag,
+                                         tabu_print_size,
+                                         tabu_list)
+            it += add_it
+            bar.update(add_it)
 
         tabu_list.appendleft(tabu_print(cur_sol,cur_obj_vec,data,p1,p2,tabu_print_size))
         while (len(tabu_list)>tabu_size):
@@ -279,7 +366,8 @@ def local_search_tabu(
 
         cur_obj_vec = objective_vec_swap(cur_sol,cur_obj_vec,p1,p2,data)
         cur_sol = swap_tsp_2(cur_sol,p1,p2)
-        cur_obj = sum(cur_obj_vec)
+        cur_obj = sum(np.sqrt(cur_obj_vec))
+        path += [it,p1,p2,cur_obj]
         #print 'it %d swap (%d %d) obj: %f'%(it,
         #                                    p1,p2,
         #                                    sum(map(np.sqrt,cur_obj_vec)))
@@ -289,7 +377,8 @@ def local_search_tabu(
             opt_obj_vec[:] = cur_obj_vec
             opt_obj = cur_obj
             #print 'it opt %d obj: %f'%(it,sum(map(np.sqrt,opt_obj_vec)))
-    return sum(map(np.sqrt,opt_obj_vec)), opt_sol
+        bar.set_description('cur/opt obj: %.0f/%.0f'%(cur_obj,opt_obj))
+    return sum(map(np.sqrt,opt_obj_vec)), opt_sol, path
 
 def dist_matrix_calc(data):
     data_x = np.repeat(data['x'].values,len(data)).reshape((len(data),len(data)))
@@ -322,16 +411,28 @@ def closest_matrix_calc_kd(data,first_closest):
 
 def solve_tsp(filename,
               max_trials,
+              neighbourhood_type,
               first_points,
               first_closest,
+              random_pick_size,
               local_search_type,
               tabu_flag = False,
               tabu_print_size = 100,
-              tabu_size = 1000):
+              tabu_size = 1000,
+              sol_step0=None,
+              step0_nb_sample=20):
     data = load_data(filename)
-    size = len(data)
-    closest_matrix = closest_matrix_calc_kd(data,first_closest)
-    sol_step0 = tsp_simple_fast_kd(data,10)
+    if os.path.isfile(outfilename(filename,'_cm')):
+        closest_matrix = pd.read_csv(outfilename(filename,'_cm'))
+        closest_matrix.columns = range(len(data))
+    else:
+        closest_matrix = closest_matrix_calc_kd(data,first_closest)
+        closest_matrix.to_csv(outfilename(filename,'_cm'),index=False)
+    if sol_step0 is None:
+        if os.path.isfile(outfilename(filename,'_step0')):
+            sol_step0 = load_sol(outfilename(filename,'_step0'))
+        else:
+            sol_step0 = best_tsp_simple(data,step0_nb_sample)
     save_sol(sol_step0,data,filename,'_step0')
     obj_vec = objective2_vec_fast(sol_step0,data)
     #tqdm.write('sol step 0 : %f'%(np.sum(np.sqrt(obj_vec))))
@@ -348,20 +449,22 @@ def solve_tsp(filename,
             tabu_print_size,
             tabu_size)
     else:
-        opt_obj, opt_sol = local_search_tabu(
+        opt_obj, opt_sol, path = local_search_tabu(
             data,
             max_trials,
             sol_step0[:],
             obj_vec,
             closest_matrix,
+            neighbourhood_type,
             first_points,
             first_closest,
+            random_pick_size,
             tabu_flag,
             tabu_print_size,
             tabu_size)
 
-    save_sol(sol_step0,data,filename,'_opt')
-    return data, sol_step0, opt_obj, opt_sol
+    save_sol(opt_sol,data,filename,'_opt')
+    return data, sol_step0, opt_obj, opt_sol, path
 
 def solve_it(input_file):
     # Modify this code to run your optimization algorithm
